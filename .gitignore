@@ -1,0 +1,22 @@
+# Keycloak, TLS, SSH, and other key material
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+
+# Local authentication credentials
+.storehub/
+token.txt
+credentials.json
+
+# Build output
+/storehub-auth
+*.exe
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
