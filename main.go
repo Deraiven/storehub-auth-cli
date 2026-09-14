@@ -9,12 +9,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,17 +27,26 @@ const (
 	ClientID    = "storehub-auth-cli"
 	Port        = "8089"
 	RedirectURI = "http://127.0.0.1:" + Port + "/callback"
+
+	refreshLockWait       = 30 * time.Second
+	refreshLockStaleAfter = 2 * time.Minute
 )
 
 var (
 	configDir       string
 	tokenFile       string
 	credentialsFile string
+	refreshLockFile string
+	tokenEndpoint   = KeycloakURL + "/token"
 )
 
 type Credentials struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
+}
+
+type tokenClaims struct {
+	Exp int64 `json:"exp"`
 }
 
 func init() {
@@ -46,6 +58,7 @@ func init() {
 	configDir = filepath.Join(home, ".storehub")
 	tokenFile = filepath.Join(configDir, "token.txt")
 	credentialsFile = filepath.Join(configDir, "credentials.json")
+	refreshLockFile = filepath.Join(configDir, "refresh.lock")
 }
 
 // ==================== 工具函数 ====================
@@ -79,7 +92,26 @@ func pkceChallenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+func atomicWrite(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".token-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+
 func saveTokens(accessToken, refreshToken string, expiresIn int64) error {
+	if accessToken == "" || refreshToken == "" || expiresIn <= 0 {
+		return fmt.Errorf("invalid token response")
+	}
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return err
 	}
@@ -87,15 +119,7 @@ func saveTokens(accessToken, refreshToken string, expiresIn int64) error {
 		return err
 	}
 
-	// 1. 写入纯文本 Token
-	if err := os.WriteFile(tokenFile, []byte(accessToken), 0600); err != nil {
-		return err
-	}
-	if err := os.Chmod(tokenFile, 0600); err != nil {
-		return err
-	}
-
-	// 2. 写入 JSON 凭证供静默刷新
+	// Persist rotated refresh credentials first, then atomically publish the access token.
 	creds := Credentials{
 		RefreshToken: refreshToken,
 		ExpiresAt:    time.Now().Unix() + expiresIn,
@@ -104,30 +128,95 @@ func saveTokens(accessToken, refreshToken string, expiresIn int64) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(credentialsFile, data, 0600); err != nil {
+	if err := atomicWrite(credentialsFile, data); err != nil {
 		return err
 	}
-	return os.Chmod(credentialsFile, 0600)
+	return atomicWrite(tokenFile, []byte(accessToken))
+}
+
+func accessTokenExpiresAt() (time.Time, error) {
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(data)), ".")
+	if len(parts) != 3 {
+		return time.Time{}, fmt.Errorf("access token is not a JWT")
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	var claims tokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return time.Time{}, err
+	}
+	if claims.Exp == 0 {
+		return time.Time{}, fmt.Errorf("access token has no exp claim")
+	}
+
+	return time.Unix(claims.Exp, 0), nil
+}
+
+func accessTokenHasAtLeast(remaining time.Duration) (time.Time, bool) {
+	expiresAt, err := accessTokenExpiresAt()
+	if err != nil {
+		return time.Time{}, false
+	}
+	return expiresAt, time.Until(expiresAt) > remaining
+}
+
+func acquireRefreshLock() (func(), error) {
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(refreshLockWait)
+	for {
+		f, err := os.OpenFile(refreshLockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+			return func() { _ = os.Remove(refreshLockFile) }, nil
+		}
+
+		if !os.IsExist(err) {
+			return nil, err
+		}
+
+		if info, statErr := os.Stat(refreshLockFile); statErr == nil && time.Since(info.ModTime()) > refreshLockStaleAfter {
+			_ = os.Remove(refreshLockFile)
+			continue
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("等待刷新锁超时: %s", refreshLockFile)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // ==================== OAuth2 逻辑 ====================
-func tryRefreshToken() bool {
+func tryRefreshToken() (bool, string) {
 	if _, err := os.Stat(credentialsFile); os.IsNotExist(err) {
-		return false
+		return false, "本地刷新凭证不存在"
 	}
 
 	data, err := os.ReadFile(credentialsFile)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("读取本地刷新凭证失败: %v", err)
 	}
 
 	var creds Credentials
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return false
+		return false, fmt.Sprintf("解析本地刷新凭证失败: %v", err)
 	}
 
 	if creds.RefreshToken == "" {
-		return false
+		return false, "本地 refresh_token 为空"
 	}
 
 	// 构造向 Keycloak 刷新的 x-www-form-urlencoded 请求
@@ -138,18 +227,19 @@ func tryRefreshToken() bool {
 		"client_id":     {ClientID},
 	}
 
-	resp, err := client.PostForm(KeycloakURL+"/token", form)
+	resp, err := client.PostForm(tokenEndpoint, form)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("请求 Keycloak 刷新失败: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, fmt.Sprintf("Keycloak 拒绝刷新（HTTP %d）: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false
+		return false, fmt.Sprintf("解析刷新响应失败: %v", err)
 	}
 
 	accToken, _ := result["access_token"].(string)
@@ -160,10 +250,12 @@ func tryRefreshToken() bool {
 	}
 
 	if accToken != "" {
-		_ = saveTokens(accToken, refToken, int64(expInRaw))
-		return true
+		if err := saveTokens(accToken, refToken, int64(expInRaw)); err != nil {
+			return false, fmt.Sprintf("写入刷新后的 Token 失败: %v", err)
+		}
+		return true, ""
 	}
-	return false
+	return false, "Keycloak 刷新响应中没有 access_token"
 }
 
 func performBrowserLogin() {
@@ -183,25 +275,40 @@ func performBrowserLogin() {
 		err  error
 	}
 	resultCh := make(chan callbackResult, 1)
+	completed := make(chan struct{}, 1)
+	var callbackOnce sync.Once
 
 	// 启动本地临时 Callback 服务
-	server := &http.Server{Addr: "127.0.0.1:" + Port}
+	server := &http.Server{Addr: "127.0.0.1:" + Port, ReadHeaderTimeout: 5 * time.Second}
 	mux := http.NewServeMux()
 	server.Handler = mux
 
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if r.Method != http.MethodGet || r.URL.Query().Get("state") != state {
+			http.Error(w, "无效的登录回调", http.StatusBadRequest)
+			return
+		}
+		accepted := false
+		callbackOnce.Do(func() { accepted = true })
+		if !accepted {
+			http.Error(w, "回调已处理", http.StatusConflict)
+			return
+		}
+		defer func() { completed <- struct{}{} }()
 		if oauthErr := r.URL.Query().Get("error"); oauthErr != "" {
 			resultCh <- callbackResult{err: fmt.Errorf("Keycloak 拒绝授权: %s", oauthErr)}
 			http.Error(w, "授权失败，可以关闭此窗口。", http.StatusBadRequest)
 			return
 		}
-		if r.URL.Query().Get("state") != state {
-			resultCh <- callbackResult{err: fmt.Errorf("OAuth state 不匹配")}
-			http.Error(w, "无效的登录回调，可以关闭此窗口。", http.StatusBadRequest)
-			return
-		}
 		code := r.URL.Query().Get("code")
 		if code != "" {
+			if err := exchangeCode(code, codeVerifier); err != nil {
+				resultCh <- callbackResult{err: err}
+				http.Error(w, "登录失败，请查看终端。", http.StatusBadGateway)
+				return
+			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, `
@@ -230,8 +337,13 @@ func performBrowserLogin() {
 		}
 	})
 
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		fmt.Printf("❌ 本地服务启动失败: %v\n", err)
+		os.Exit(1)
+	}
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("❌ 本地服务启动失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -253,74 +365,122 @@ func performBrowserLogin() {
 	}
 
 	// 等待回调拿到授权码
-	callback := <-resultCh
-	_ = server.Shutdown(context.Background())
+	var callback callbackResult
+	select {
+	case callback = <-resultCh:
+		<-completed
+	case <-time.After(5 * time.Minute):
+		callback.err = fmt.Errorf("登录等待超时，请重试")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
 	if callback.err != nil {
 		fmt.Printf("❌ 登录失败: %v\n", callback.err)
 		os.Exit(1)
 	}
 
-	fmt.Println("🔑 已获取授权码，正在向 Keycloak 换取凭证...")
+	fmt.Printf("🎉 登录成功！临时 Token 已写入/替换: %s\n", tokenFile)
+}
+
+func exchangeCode(code, verifier string) error {
+	unlock, err := acquireRefreshLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	client := &http.Client{Timeout: 10 * time.Second}
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {ClientID},
-		"code":          {callback.code},
+		"code":          {code},
 		"redirect_uri":  {RedirectURI},
-		"code_verifier": {codeVerifier},
+		"code_verifier": {verifier},
 	}
 
-	resp, err := client.PostForm(KeycloakURL+"/token", form)
+	resp, err := client.PostForm(tokenEndpoint, form)
 	if err != nil {
-		fmt.Printf("❌ 请求 Token 失败: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("请求 Token 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		fmt.Printf("❌ 换取 Token 失败（HTTP %d）: %s\n", resp.StatusCode, body)
-		os.Exit(1)
+		return fmt.Errorf("换取 Token 失败（HTTP %d）", resp.StatusCode)
 	}
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Printf("❌ 无法解析 Token 响应: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("无法解析 Token 响应: %w", err)
 	}
 
 	accToken, _ := result["access_token"].(string)
 	refToken, _ := result["refresh_token"].(string)
 	expInRaw, _ := result["expires_in"].(float64)
 
-	if accToken == "" {
-		fmt.Println("❌ Keycloak 响应中没有 access_token")
-		os.Exit(1)
-	}
-	if saveTokens(accToken, refToken, int64(expInRaw)) == nil {
-		fmt.Printf("🎉 登录成功！临时 Token 已写入/替换: %s\n", tokenFile)
-	} else {
-		fmt.Println("❌ Token 写入本地文件失败！")
-		os.Exit(1)
-	}
+	return saveTokens(accToken, refToken, int64(expInRaw))
 }
 
 // ==================== 主入口 ====================
 func main() {
 	force := flag.Bool("force", false, "强制弹窗重新登录，忽略本地缓存")
 	flag.BoolVar(force, "f", false, "强制弹窗重新登录，忽略本地缓存")
+	refreshOnly := flag.Bool("refresh-only", false, "仅静默刷新 Token；失败时不打开浏览器")
+	flag.BoolVar(refreshOnly, "r", false, "仅静默刷新 Token；失败时不打开浏览器")
 	flag.Parse()
+
+	if *force && *refreshOnly {
+		fmt.Println("❌ --force 与 --refresh-only 不能同时使用")
+		os.Exit(2)
+	}
 
 	if *force {
 		performBrowserLogin()
 		return
 	}
 
-	fmt.Println("🔍 正在检查本地凭证状态...")
-	if tryRefreshToken() {
+	if *refreshOnly {
+		fmt.Println("🔄 正在静默刷新本地 Token...")
+		unlock, err := acquireRefreshLock()
+		if err != nil {
+			fmt.Printf("❌ 无法获取刷新锁: %v\n", err)
+			os.Exit(1)
+		}
+
+		ok, reason := tryRefreshToken()
+		unlock()
+		if !ok {
+			fmt.Printf("❌ 静默刷新失败: %s\n", reason)
+			fmt.Println("👉 请在终端运行 storehub-auth --force 重新登录。")
+			os.Exit(1)
+		}
+
+		fmt.Printf("✅ Token 静默刷新成功: %s\n", tokenFile)
+		return
+	}
+
+	fmt.Println("🔍 正在检查本地凭证状态，准备静默刷新...")
+	unlock, err := acquireRefreshLock()
+	if err != nil {
+		fmt.Printf("⚠️ 无法获取刷新锁: %v\n", err)
+		if expiresAt, ok := accessTokenHasAtLeast(0); ok {
+			fmt.Printf("✅ 本地 Access Token 仍未过期，过期时间: %s\n👉 继续使用: %s\n", expiresAt.Local().Format(time.RFC3339), tokenFile)
+			return
+		}
+		fmt.Println("ℹ️ 本地 Token 不可用，需要重新授信。")
+		performBrowserLogin()
+		return
+	}
+	ok, reason := tryRefreshToken()
+	unlock()
+	if ok {
 		fmt.Printf("✨ 检测到有效会话，已在后台完成自动续期！\n👉 Token 已更新替换至: %s\n", tokenFile)
 	} else {
-		fmt.Println("ℹ️ 本地无有效凭证或已过期，需要重新授信。")
+		fmt.Printf("⚠️ 静默刷新失败: %s\n", reason)
+		if expiresAt, ok := accessTokenHasAtLeast(0); ok {
+			fmt.Printf("✅ 本地 Access Token 仍未过期，过期时间: %s\n👉 暂时继续使用: %s\n", expiresAt.Local().Format(time.RFC3339), tokenFile)
+			return
+		}
+		fmt.Println("ℹ️ 本地 Token 已不可用，需要重新授信。")
 		performBrowserLogin()
 	}
 }

@@ -1,5 +1,7 @@
 # StoreHub Auth CLI
 
+公司内部安装、Grafana MCP 包装器和 Token 自动刷新方案请参阅：[docs/internal-installation.md](docs/internal-installation.md)。
+
 `storehub-auth` 是 StoreHub 内部命令行登录工具。它通过 Keycloak、Google 登录和 OAuth 2.0 Authorization Code + PKCE 获取个人短期 Access Token，供 Grafana API、Grafana MCP 等本地工具使用。
 
 认证链路：
@@ -99,11 +101,13 @@ storehub-auth
 
 执行逻辑：
 
-1. 如果本地存在可用 Refresh Token，工具会静默刷新 Access Token。
-2. 如果没有本地凭证、Refresh Token 已失效或续期失败，工具会打开默认浏览器。
-3. Google / Keycloak 登录成功后，浏览器回调到 `http://127.0.0.1:8089/callback`。
-4. 新 Token 会覆盖写入本地文件。
-5. 成功页面会在 1.5 秒后尝试自动关闭当前标签页；如果浏览器阻止自动关闭，可手动关闭，不影响登录结果。
+1. 如果本地存在 Refresh Token，工具会优先向 Keycloak 静默刷新 Access Token。
+2. 为避免多个终端或 MCP 进程同时刷新，工具会使用本地刷新锁串行化刷新请求。
+3. 如果静默刷新成功，新 Token 会覆盖写入本地文件。
+4. 如果静默刷新失败但现有 Access Token 仍未过期，工具会继续复用现有 Token，不打开浏览器。
+5. 如果没有可用 Token 或本地登录状态已失效，工具会打开默认浏览器。
+6. Google / Keycloak 登录成功后，浏览器回调到 `http://127.0.0.1:8089/callback`。
+7. 成功页面会在 1.5 秒后尝试自动关闭当前标签页；如果浏览器阻止自动关闭，可手动关闭，不影响登录结果。
 
 强制忽略本地会话并重新打开浏览器：
 
